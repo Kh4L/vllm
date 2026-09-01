@@ -8,11 +8,15 @@ For MoE models, particularly those like DeepSeek that employ MLA (Multi-head Lat
 
 In these cases, the data parallel ranks are not completely independent. Forward passes must be aligned, and expert layers across all ranks are required to synchronize during every forward pass, even when there are fewer requests to be processed than DP ranks.
 
-By default, expert layers form a tensor parallel group of size `DP × TP`. To use expert parallelism instead, include the `--enable-expert-parallel` CLI arg (on all nodes in the multi-node case). See [Expert Parallel Deployment](expert_parallel_deployment.md) for details on how attention and expert layers behave differently with EP enabled.
+For MoE models, three topologies are supported for the expert layers under data parallelism:
+
+- **Sharded experts (default)**: expert layers form a tensor parallel group of size `DP × TP`, dividing the expert weights across the DP ranks.
+- **Expert parallelism**: include the `--enable-expert-parallel` CLI arg (on all nodes in the multi-node case) to distribute whole experts across the same group. See [Expert Parallel Deployment](expert_parallel_deployment.md) for details on how attention and expert layers behave differently with EP enabled.
+- **Replicated experts**: include the `--data-parallel-replicate-moe` CLI arg (on all nodes in the multi-node case) to load complete expert weights on every DP rank and run the ranks as fully independent replicas, like dense-model data parallelism. See [Replicated MoE](#replicated-moe) below.
 
 In vLLM, each DP rank is deployed as a separate "core engine" process that communicates with front-end process(es) via ZMQ sockets. Data Parallel attention can be combined with Tensor Parallel attention, in which case each DP engine owns a number of per-GPU worker processes equal to the configured TP size.
 
-For MoE models, when any requests are in progress in any rank, we must ensure that empty "dummy" forward passes are performed in all ranks that don't currently have any requests scheduled. This is handled via a separate DP Coordinator process that communicates with all ranks, and a collective operation performed every N steps to determine when all ranks become idle and can be paused. When TP is used in conjunction with DP, expert layers form a group of size `DP × TP` (using either tensor parallelism by default, or expert parallelism if `--enable-expert-parallel` is set).
+For MoE models whose expert layers span the DP ranks (the sharded and expert-parallel topologies above), when any requests are in progress in any rank, we must ensure that empty "dummy" forward passes are performed in all ranks that don't currently have any requests scheduled. This is handled via a separate DP Coordinator process that communicates with all ranks, and a collective operation performed every N steps to determine when all ranks become idle and can be paused. When TP is used in conjunction with DP, expert layers form a group of size `DP × TP` (using either tensor parallelism by default, or expert parallelism if `--enable-expert-parallel` is set). None of this synchronization applies to the replicated topology, whose ranks execute independently.
 
 In all cases, it is beneficial to load-balance requests between DP ranks. For online deployments, this balancing can be optimized by taking into account the state of each DP engine - in particular its currently scheduled and waiting (queued) requests, and KV cache state. Each DP engine has an independent KV cache, and the benefit of prefix caching can be maximized by directing prompts intelligently.
 
@@ -80,6 +84,20 @@ When deploying large DP sizes using this method, the API server process can beco
 ![DP Internal LB Diagram](../assets/deployment/dp_internal_lb.png)
 </figure>
 
+### Replicated MoE
+
+For MoE models that fit on a single GPU (or a single TP group), `--data-parallel-replicate-moe` combines the single-endpoint convenience of internal load balancing with fully independent execution: every DP rank loads complete expert weights and runs without any cross-DP collectives, wave synchronization, or dummy forward passes (tensor parallelism within a replica is unaffected). This eliminates the coordination overhead of the DP-spanning expert topologies at the cost of no expert-weight memory savings.
+
+```bash
+vllm serve $MODEL --data-parallel-size 2 --data-parallel-replicate-moe
+```
+
+The DP Coordinator is still used, but only to collect the queue and KV-cache statistics that drive load balancing (identical to dense-model data parallelism).
+
+This mode is experimental and currently fails at startup for unsupported combinations: it requires `--data-parallel-size` > 1, online serving with the `"mp"` data parallel backend, and internal load balancing, and is incompatible with `--enable-expert-parallel` (and features requiring it, e.g. EPLB and elastic EP), pipeline parallelism, fault tolerance, dual batch overlap, the external launcher, the MoRIIO KV connector, and any real `--all2all-backend` other than the default `allgather_reducescatter` (the removed `pplx`/`naive` aliases still fall back to the default). Tensor parallelism within each replica is supported.
+
+Note the prefix-cache implications: each replica keeps a private KV/prefix cache, and the internal load balancer considers aggregate queue and cache utilization but carries no prefix or session affinity. Multi-turn or shared-prefix traffic may therefore land on a replica without the cached prefix, duplicating the cache working set across replicas (up to `N×` for `N` replicas) and losing reuse. To retain reuse for session traffic, pin follow-up requests to a rank with the `X-data-parallel-rank` request header, or place a session-affinity-aware router in front.
+
 ## Hybrid Load Balancing
 
 Hybrid load balancing sits between the internal and external approaches. Each node runs its own API server(s) that only queue requests to the data-parallel engines colocated on that node. An upstream load balancer (for example, an ingress controller or traffic router) spreads user requests across those per-node endpoints.
@@ -98,7 +116,7 @@ For larger scale deployments especially, it can make sense to handle the orchest
 
 In this case, it's more convenient to treat each DP rank like a separate vLLM deployment, with its own endpoint, and have an external router balance HTTP requests between them, making use of appropriate real-time telemetry from each server for routing decisions.
 
-This can already be done trivially for non-MoE models, since each deployed server is fully independent. In that case, launch independent vLLM instances without any `--data-parallel-*` arguments; external DP CLI options are only supported for MoE deployments.
+This can already be done trivially for non-MoE models, since each deployed server is fully independent. In that case, launch independent vLLM instances without any `--data-parallel-*` arguments; external DP CLI options are only supported for MoE deployments. The same fully-independent-servers approach also works for MoE models that fit within a single server (and is equivalent to what `--data-parallel-replicate-moe` provides behind a single endpoint).
 
 We support an equivalent topology for MoE DP+EP which can be configured via the following CLI arguments.
 
