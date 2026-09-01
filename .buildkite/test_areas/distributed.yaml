@@ -48,6 +48,8 @@ steps:
   - vllm/worker/worker_base.py
   - vllm/v1/engine/
   - vllm/v1/worker/
+  - vllm/config/parallel.py
+  - vllm/config/vllm.py
   - tests/v1/distributed
   - tests/entrypoints/launchers/api_server/test_multi_api_servers.py
   commands:
@@ -56,6 +58,7 @@ steps:
   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
   - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
+  - TP_SIZE=1 DP_SIZE=2 pytest -v -s v1/distributed/test_replicated_moe_dp.py
   - DP_SIZE=2 pytest -v -s entrypoints/launchers/api_server/test_multi_api_servers.py
   mirror:
     amd:
@@ -73,6 +76,8 @@ steps:
       - vllm/worker/worker_base.py
       - vllm/v1/engine/
       - vllm/v1/worker/
+      - vllm/config/parallel.py
+      - vllm/config/vllm.py
       - tests/v1/distributed
       - tests/entrypoints/launchers/api_server/test_multi_api_servers.py
       - vllm/platforms/rocm.py
@@ -177,6 +182,8 @@ steps:
   source_file_dependencies:
   - vllm/distributed/
   - "!vllm/distributed/kv_transfer/"
+  - vllm/config/parallel.py
+  - vllm/config/vllm.py
   - tests/v1/distributed
   - tests/v1/engine/test_engine_core_client.py
   - tests/distributed/test_utils
@@ -186,6 +193,8 @@ steps:
   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_async_llm_dp.py
   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_eagle_dp.py
   - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_external_lb_dp.py
+  - TP_SIZE=2 DP_SIZE=2 pytest -v -s v1/distributed/test_replicated_moe_dp.py
+  - TP_SIZE=1 DP_SIZE=4 pytest -v -s v1/distributed/test_replicated_moe_dp.py
   - TP_SIZE=1 DP_SIZE=4 pytest -v -s v1/distributed/test_dense_dp_world_size.py
   - TP_SIZE=1 DP_SIZE=4 pytest -v -s v1/distributed/test_internal_lb_dp.py
   - TP_SIZE=1 DP_SIZE=4 pytest -v -s v1/distributed/test_hybrid_lb_dp.py
