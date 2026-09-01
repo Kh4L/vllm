@@ -858,6 +858,146 @@ def test_reconfigure_for_independent_dp_rank_on_multinode_dense_model():
     assert parallel_config.world_size == 8
 
 
+def test_reconfigure_for_independent_dp_rank_on_replicated_moe_model():
+    """A replicated-MoE rank localizes to DP=1 exactly like a dense rank,
+    preserving its global identity (data_parallel_index) and the replicate
+    flag itself."""
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=2,
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+        data_parallel_rank=1,
+        is_moe_model=True,
+        data_parallel_replicate_moe=True,
+        distributed_executor_backend="mp",
+    )
+
+    parallel_config.reconfigure_for_independent_dp_rank()
+
+    assert parallel_config.data_parallel_size == 1
+    assert parallel_config.data_parallel_size_local == 1
+    assert parallel_config.data_parallel_rank == 0
+    assert parallel_config.data_parallel_index == 1
+    assert parallel_config.data_parallel_replicate_moe
+    assert not parallel_config.moe_spans_dp
+    assert parallel_config.world_size == 2
+
+
+@pytest.mark.parametrize(
+    ("is_moe_model", "replicate_moe", "expected"),
+    [
+        # MoE models span DP by default.
+        (True, False, True),
+        # Replication opts out of DP-spanning experts and lockstep execution.
+        (True, True, False),
+        # Dense models never span DP.
+        (False, False, False),
+        # Unknown model type is treated as non-spanning by the predicate;
+        # callers needing a conservative default check model_config is None.
+        (None, False, False),
+    ],
+)
+def test_moe_spans_dp(is_moe_model, replicate_moe, expected):
+    parallel_config = ParallelConfig(
+        data_parallel_size=2,
+        is_moe_model=is_moe_model,
+        data_parallel_replicate_moe=replicate_moe,
+    )
+    assert parallel_config.moe_spans_dp == expected
+
+
+def test_data_parallel_replicate_moe_affects_config_hash():
+    """The replicate flag must participate in the DP startup-handshake config
+    hash so that cross-rank divergence is detected."""
+    base = ParallelConfig(data_parallel_size=2, is_moe_model=True)
+    replicated = ParallelConfig(
+        data_parallel_size=2, is_moe_model=True, data_parallel_replicate_moe=True
+    )
+    assert base.compute_hash() != replicated.compute_hash()
+
+
+@pytest.mark.parametrize(
+    ("extra_kwargs", "expected_error", "match"),
+    [
+        ({"data_parallel_size": 1}, ValidationError, "data_parallel_size > 1"),
+        ({"is_moe_model": False}, ValidationError, "only applicable to MoE"),
+        ({"enable_expert_parallel": True}, ValidationError, "enable-expert-parallel"),
+        ({"enable_fault_tolerance": True}, NotImplementedError, "fault tolerance"),
+        ({"pipeline_parallel_size": 2}, NotImplementedError, "pipeline parallelism"),
+        ({"enable_eplb": True}, ValidationError, "EPLB"),
+        ({"enable_dbo": True}, ValidationError, "dual batch overlap"),
+        ({"ubatch_size": 2}, ValidationError, "dual batch overlap"),
+        (
+            {"all2all_backend": "deepep_low_latency"},
+            ValidationError,
+            "all2all",
+        ),
+        ({"data_parallel_backend": "ray"}, NotImplementedError, "ray"),
+        (
+            {"data_parallel_external_lb": True},
+            NotImplementedError,
+            "load balancing",
+        ),
+        (
+            {"data_parallel_hybrid_lb": True},
+            NotImplementedError,
+            "load balancing",
+        ),
+        (
+            {"distributed_executor_backend": "external_launcher"},
+            NotImplementedError,
+            "external launcher",
+        ),
+    ],
+)
+def test_data_parallel_replicate_moe_invalid_combos(
+    extra_kwargs, expected_error, match
+):
+    kwargs = {
+        "data_parallel_size": 2,
+        "is_moe_model": True,
+        "data_parallel_replicate_moe": True,
+        **extra_kwargs,
+    }
+    with pytest.raises(expected_error, match=match):
+        ParallelConfig(**kwargs)
+
+
+@pytest.mark.parametrize("alias", ["pplx", "naive"])
+def test_data_parallel_replicate_moe_accepts_removed_all2all_aliases(alias):
+    """The removed pplx/naive aliases normalize to the default backend before
+    the replicate-mode all2all check, so they are accepted (with the usual
+    fallback warning) rather than rejected."""
+    parallel_config = ParallelConfig(
+        data_parallel_size=2,
+        is_moe_model=True,
+        data_parallel_replicate_moe=True,
+        all2all_backend=alias,
+    )
+    assert parallel_config.all2all_backend == "allgather_reducescatter"
+
+
+def test_data_parallel_replicate_moe_valid_combo():
+    """The validated envelope (online mp backend, internal LB) is accepted and
+    is a no-op on unrelated fields."""
+    parallel_config = ParallelConfig(
+        data_parallel_size=2,
+        is_moe_model=True,
+        data_parallel_replicate_moe=True,
+    )
+    assert not parallel_config.moe_spans_dp
+    assert not parallel_config.enable_expert_parallel
+
+
+def test_data_parallel_replicate_moe_rejected_offline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The offline env-var (SPMD) DP path fails closed."""
+    monkeypatch.setenv("VLLM_DP_SIZE", "2")
+    with pytest.raises(NotImplementedError, match="offline data parallel"):
+        ParallelConfig(is_moe_model=True, data_parallel_replicate_moe=True)
+
+
 def test_draft_model_enables_async_scheduling_by_default():
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
     model_config = ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048)
@@ -2152,28 +2292,36 @@ def test_scheduler_config_init():
         "model_id",
         "data_parallel_size",
         "external_lb",
+        "replicate_moe",
         "expected_needs_coordinator",
+        "expected_wave_coordination",
     ),
     [
         # Non-MoE model with DP=1 should not need coordinator
-        ("facebook/opt-125m", 1, False, False),
+        ("facebook/opt-125m", 1, False, False, False, False),
         # Non-MoE model with DP>1 internal LB should need coordinator
-        ("facebook/opt-125m", 2, False, True),
+        ("facebook/opt-125m", 2, False, False, True, False),
         # MoE model with DP=1 should not need coordinator
-        ("mistralai/Mixtral-8x7B-Instruct-v0.1", 1, False, False),
+        ("mistralai/Mixtral-8x7B-Instruct-v0.1", 1, False, False, False, False),
         # MoE model with DP>1 internal LB should need both coordinator
         # and wave coordination
-        ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, False, True),
+        ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, False, False, True, True),
         # MoE model with DP>1 external LB needs coordinator for wave coordination
         # (wave coordination runs in coordinator process)
-        ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, True, True),
+        ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, True, False, True, True),
+        # Replicated MoE with DP>1 internal LB keeps the coordinator for
+        # stats-based load balancing but disables wave coordination,
+        # exactly like dense-model DP.
+        ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, False, True, True, False),
     ],
 )
 def test_needs_dp_coordination(
     model_id,
     data_parallel_size,
     external_lb,
+    replicate_moe,
     expected_needs_coordinator,
+    expected_wave_coordination,
 ):
     """Test that DP coordinator and wave coordination are configured correctly."""
     from vllm.config import ParallelConfig
@@ -2182,10 +2330,63 @@ def test_needs_dp_coordination(
     parallel_config = ParallelConfig(
         data_parallel_size=data_parallel_size,
         data_parallel_external_lb=external_lb,
+        data_parallel_replicate_moe=replicate_moe,
     )
     vllm_config = VllmConfig(model_config=model_config, parallel_config=parallel_config)
 
     assert vllm_config.needs_dp_coordinator == expected_needs_coordinator
+    # launch_core_engines enables wave coordination iff the expert layers
+    # span the DP ranks.
+    wave_coordination = (
+        vllm_config.needs_dp_coordinator and vllm_config.parallel_config.moe_spans_dp
+    )
+    assert wave_coordination == expected_wave_coordination
+
+
+def test_data_parallel_replicate_moe_rejected_for_dense_model():
+    """The VllmConfig-level backstop rejects the flag when the model turns out
+    to be dense (ParallelConfig alone may not know the model type)."""
+    model_config = ModelConfig("facebook/opt-125m")
+    parallel_config = ParallelConfig(
+        data_parallel_size=2,
+        data_parallel_replicate_moe=True,
+    )
+    with pytest.raises(ValueError, match="only applicable to MoE"):
+        VllmConfig(model_config=model_config, parallel_config=parallel_config)
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        # Direct MoRIIO connector.
+        KVTransferConfig(kv_connector="MoRIIOConnector", kv_role="kv_both"),
+        # MoRIIO nested inside MultiConnector must also be rejected.
+        KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "MoRIIOConnector", "kv_role": "kv_both"},
+                ]
+            },
+        ),
+    ],
+)
+def test_data_parallel_replicate_moe_rejects_moriio(kv_transfer_config):
+    """MoRIIO derives ports and routing identity from the DP fields that
+    replicated-MoE localization rewrites, so it must fail closed."""
+    model_config = ModelConfig("mistralai/Mixtral-8x7B-Instruct-v0.1")
+    parallel_config = ParallelConfig(
+        data_parallel_size=2,
+        is_moe_model=True,
+        data_parallel_replicate_moe=True,
+    )
+    with pytest.raises(NotImplementedError, match="MoRIIO"):
+        VllmConfig(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            kv_transfer_config=kv_transfer_config,
+        )
 
 
 def test_fault_tolerance_requires_single_api_server():

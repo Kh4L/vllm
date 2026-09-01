@@ -737,20 +737,22 @@ class VllmConfig:
         Determine if the DPCoordinator process is needed.
 
         The DPCoordinator is needed in two cases:
-        1. For MoE models with DP > 1: to handle wave coordination
-           (even in external LB mode, since wave coordination runs in the coordinator)
-        2. For non-MoE models in internal/hybrid LB mode: to collect and publish
-           queue stats for load balancing across DP ranks
+        1. For MoE models whose expert layers span the DP ranks: to handle
+           wave coordination (even in external LB mode, since wave
+           coordination runs in the coordinator)
+        2. For independent DP ranks (dense models and replicated MoE) in
+           internal/hybrid LB mode: to collect and publish queue stats for
+           load balancing across DP ranks
 
         Returns:
             True if DPCoordinator process is needed, False otherwise.
         """
 
-        # For non-MoE models, only need coordinator in internal/hybrid LB mode
-        # (for stats collection).
+        # For independent DP ranks, only need coordinator in internal/hybrid
+        # LB mode (for stats collection).
         return self.parallel_config.data_parallel_size > 1 and (
             self.model_config is None
-            or self.model_config.is_moe
+            or self.parallel_config.moe_spans_dp
             or not self.parallel_config.data_parallel_external_lb
         )
 
@@ -1099,6 +1101,26 @@ class VllmConfig:
 
             self.parallel_config.is_moe_model = self.model_config.is_moe
 
+            if (
+                self.parallel_config.data_parallel_replicate_moe
+                and not self.model_config.is_moe
+            ):
+                raise ValueError(
+                    "--data-parallel-replicate-moe is only applicable to MoE "
+                    "models. Dense models already run as independent replicas "
+                    "under data parallelism."
+                )
+
+        if (
+            self.parallel_config.data_parallel_replicate_moe
+            and self.kv_transfer_config is not None
+            and self.kv_transfer_config.has_connector("MoRIIOConnector")
+        ):
+            raise NotImplementedError(
+                "--data-parallel-replicate-moe is not supported with the "
+                "MoRIIO KV connector."
+            )
+
         if (
             self.model_config is not None
             and self.model_config.enable_return_routed_experts
@@ -1317,7 +1339,7 @@ class VllmConfig:
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
                 if self.parallel_config.data_parallel_size > 1 and (
-                    self.model_config is None or self.model_config.is_moe
+                    self.model_config is None or self.parallel_config.moe_spans_dp
                 ):
                     logger.info_once(
                         "Disabling NCCL for DP synchronization "
@@ -1666,10 +1688,12 @@ class VllmConfig:
         # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)
         self._set_compile_ranges()
 
-        # Do this after all the updates to compilation_config.mode
+        # Do this after all the updates to compilation_config.mode.
+        # Independent DP ranks (dense models and replicated MoE) compile
+        # without any cross-DP communication, so they use DP size 1.
         effective_dp_size = (
             self.parallel_config.data_parallel_size
-            if self.model_config is None or self.model_config.is_moe
+            if self.model_config is None or self.parallel_config.moe_spans_dp
             else 1
         )
         self.compilation_config.set_splitting_ops_for_v1(

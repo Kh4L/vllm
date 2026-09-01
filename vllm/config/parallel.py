@@ -128,7 +128,9 @@ class ParallelConfig:
     the process world size but does not increase the KV-cache shard count."""
     data_parallel_size: int = Field(default=1, ge=1)
     """Number of data parallel groups. MoE layers will be sharded according to
-    the product of the tensor, prefill-context, and data parallel sizes."""
+    the product of the tensor, prefill-context, and data parallel sizes
+    (unless `data_parallel_replicate_moe` is set, in which case each data
+    parallel rank holds a complete copy of the expert weights)."""
     data_parallel_size_local: int = Field(default=1, ge=0)
     """Number of local data parallel groups. A value of 0 is a sentinel used by
     the engine-args layer to signal that data parallelism was specified
@@ -160,6 +162,15 @@ class ParallelConfig:
     between local data parallel ranks, but an external LB balances
     between vLLM nodes/replicas. Set explicitly in conjunction with
     --data-parallel-start-rank."""
+    data_parallel_replicate_moe: bool = False
+    """Replicate complete MoE expert weights on every data parallel rank and
+    run the ranks as fully independent replicas behind a single API endpoint
+    (like data parallelism for dense models). This avoids the cross-DP
+    dispatch/combine collectives and lockstep wave scheduling that MoE data
+    parallelism otherwise requires, at the cost of no memory savings from
+    sharding the experts. Only supported for online serving with the "mp"
+    data parallel backend and vLLM's internal load balancing. Incompatible
+    with --enable-expert-parallel."""
     is_moe_model: bool | None = None
     """Whether the deployed model is MoE (if known)."""
     enable_expert_parallel: bool = False
@@ -504,6 +515,66 @@ class ParallelConfig:
                 "data_parallel_external_lb can only be set when data_parallel_size > 1"
             )
 
+        if self.data_parallel_replicate_moe:
+            if self.data_parallel_size <= 1:
+                raise ValueError(
+                    "--data-parallel-replicate-moe requires data_parallel_size > 1"
+                )
+            if self.enable_fault_tolerance:
+                raise NotImplementedError(
+                    "--data-parallel-replicate-moe is not yet supported with "
+                    "fault tolerance."
+                )
+            if self.pipeline_parallel_size > 1:
+                raise NotImplementedError(
+                    "--data-parallel-replicate-moe is not yet supported with "
+                    "pipeline parallelism."
+                )
+            if self.is_moe_model is False:
+                raise ValueError(
+                    "--data-parallel-replicate-moe is only applicable to MoE "
+                    "models. Dense models already run as independent replicas "
+                    "under data parallelism."
+                )
+            if self.enable_expert_parallel:
+                raise ValueError(
+                    "--data-parallel-replicate-moe replicates complete expert "
+                    "weights on every data parallel rank and cannot be "
+                    "combined with --enable-expert-parallel."
+                )
+            if self.enable_eplb or self.enable_elastic_ep:
+                raise ValueError(
+                    "--data-parallel-replicate-moe is not compatible with "
+                    "EPLB or elastic expert parallelism (both require "
+                    "--enable-expert-parallel)."
+                )
+            if self.use_ubatching:
+                raise ValueError(
+                    "--data-parallel-replicate-moe is not compatible with "
+                    "dual batch overlap or ubatching."
+                )
+            if self.all2all_backend != "allgather_reducescatter":
+                # The removed "pplx"/"naive" aliases were already normalized
+                # to the default above, so only real non-default backends
+                # reach this check.
+                raise ValueError(
+                    "--data-parallel-replicate-moe does not use any all2all "
+                    "communication; setting a non-default --all2all-backend "
+                    f"({self.all2all_backend}) is not supported."
+                )
+            if self.data_parallel_backend == "ray":
+                raise NotImplementedError(
+                    "--data-parallel-replicate-moe is not yet supported with "
+                    "the ray data parallel backend. Use the default 'mp' "
+                    "backend."
+                )
+            if self.data_parallel_external_lb or self.data_parallel_hybrid_lb:
+                raise NotImplementedError(
+                    "--data-parallel-replicate-moe is not yet supported with "
+                    "external or hybrid data parallel load balancing. Use "
+                    "vLLM's internal load balancing (a single API endpoint)."
+                )
+
         if not self.numa_bind and (
             self.numa_bind_nodes is not None or self.numa_bind_cpus is not None
         ):
@@ -596,6 +667,19 @@ class ParallelConfig:
         Client manages local EngineCores in hybrid and external LB case.
         """
         return self.data_parallel_external_lb or self.data_parallel_hybrid_lb
+
+    @property
+    def moe_spans_dp(self) -> bool:
+        """Whether MoE layers span the data parallel ranks (experts sharded
+        across a group of size DP x PCP x TP, with coordinated lockstep DP
+        execution). False for dense models and when
+        `data_parallel_replicate_moe` is enabled, in which case DP ranks are
+        fully independent replicas.
+
+        This deliberately does not check `data_parallel_size > 1`; callers
+        that need a DP-specific condition combine it with their own DP term.
+        """
+        return bool(self.is_moe_model) and not self.data_parallel_replicate_moe
 
     def get_next_dp_init_port(self) -> int:
         """
@@ -898,6 +982,14 @@ class ParallelConfig:
 
         if self.data_parallel_size > 1 or self.data_parallel_size_local == 0:
             # Data parallel was specified in the engine args.
+            if (
+                self.data_parallel_replicate_moe
+                and self.distributed_executor_backend == "external_launcher"
+            ):
+                raise NotImplementedError(
+                    "--data-parallel-replicate-moe is not supported with the "
+                    "external launcher."
+                )
             if self.distributed_executor_backend == "external_launcher":
                 # For external launcher,
                 # we need to set the data parallel rank automatically
@@ -932,6 +1024,11 @@ class ParallelConfig:
                 raise ValueError(
                     "Offline data parallel mode is not supported/useful"
                     " for dense models."
+                )
+            if self.data_parallel_size > 1 and self.data_parallel_replicate_moe:
+                raise NotImplementedError(
+                    "--data-parallel-replicate-moe is not supported in"
+                    " offline data parallel mode."
                 )
 
         self.data_parallel_index = self.data_parallel_rank
@@ -1068,7 +1165,10 @@ class ParallelConfig:
         return self
 
     def reconfigure_for_independent_dp_rank(self) -> None:
-        """Reconfigure for a single independent non-MoE DP rank."""
+        """Reconfigure for a single independent DP rank (a dense model or a
+        replicated-MoE model). `data_parallel_index` and
+        `data_parallel_rank_local` are preserved as the rank's global and
+        node-local identity."""
         # Capture these before changing DP fields.
         nnodes = self.nnodes_within_dp
         node_rank = self.node_rank_within_dp
