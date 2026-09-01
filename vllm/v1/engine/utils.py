@@ -106,7 +106,7 @@ class EngineHandshakeMetadata:
     """
 
     addresses: EngineZmqAddresses
-    parallel_config: dict[str, int | str | list[int]]
+    parallel_config: dict[str, bool | int | str | list[int]]
 
 
 def _make_control_bundle(node_ip: str) -> dict[str, float]:
@@ -427,7 +427,7 @@ class CoreEngineActorManager:
         dp_size = vllm_config.parallel_config.data_parallel_size
         actor_class = (
             DPMoEEngineCoreActor
-            if dp_size > 1 and vllm_config.model_config.is_moe
+            if dp_size > 1 and vllm_config.parallel_config.moe_spans_dp
             else EngineCoreActor
         )
 
@@ -870,7 +870,7 @@ class CoreEngineActorManager:
 
         actor_class = (
             DPMoEEngineCoreActor
-            if cur_vllm_config.model_config.is_moe
+            if cur_vllm_config.parallel_config.moe_spans_dp
             else EngineCoreActor
         )
 
@@ -1130,7 +1130,8 @@ def launch_core_engines(
     # Run the DP Coordinator process with rank 0 when in online DP mode.
     # The coordinator is needed for:
     # 1. Internal/hybrid LB: collecting and publishing queue stats for load balancing
-    # 2. MoE models: wave coordination in addition to stats
+    # 2. MoE models whose expert layers span the DP ranks: wave coordination
+    #    in addition to stats
     run_coordinator = (
         vllm_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
     )
@@ -1138,7 +1139,7 @@ def launch_core_engines(
     if run_coordinator:
         coordinator = DPCoordinator(
             parallel_config,
-            enable_wave_coordination=vllm_config.model_config.is_moe,
+            enable_wave_coordination=parallel_config.moe_spans_dp,
         )
 
         addresses.coordinator_input, addresses.coordinator_output = (
@@ -1241,9 +1242,12 @@ def launch_core_engines(
             handshake_socket,
             engines_to_handshake,
             parallel_config,
-            dp_size > 1 and vllm_config.model_config.is_moe,
+            dp_size > 1 and parallel_config.moe_spans_dp,
             vllm_config.cache_config,
             launch,
+            replicated_moe_dp=(
+                dp_size > 1 and parallel_config.data_parallel_replicate_moe
+            ),
         )
 
 
@@ -1254,6 +1258,7 @@ def wait_for_engine_startup(
     coordinated_dp: bool,
     cache_config: CacheConfig,
     launch: CoreEngineLaunch,
+    replicated_moe_dp: bool = False,
 ):
     # Wait for engine core process(es) to send ready messages.
     local_count = parallel_config.data_parallel_size_local
@@ -1362,21 +1367,50 @@ def wait_for_engine_startup(
                 )
 
         if status == "HELLO" and engine.state == CoreEngineState.NEW:
+            # Fail fast if the engine disagrees about whether MoE DP ranks
+            # are coordinated or independent replicas (e.g. per-node config
+            # divergence in a multi-node deployment). A mismatched engine
+            # would otherwise hang joining a DP group with no peers, or be
+            # silently re-widened by the init message below. A replicated
+            # front-end requires an explicit True; any other front-end
+            # rejects an explicit True (the key is absent from
+            # colocated-front-end handshakes in external/hybrid LB and from
+            # engines of older vLLM versions, which is tolerated).
+            engine_replicate = msg.get("data_parallel_replicate_moe")
+            replicate_mismatch = (
+                engine_replicate is not True
+                if replicated_moe_dp
+                else engine_replicate is True
+            )
+            if replicate_mismatch:
+                raise RuntimeError(
+                    f"Engine {eng_index} was started with "
+                    f"data_parallel_replicate_moe={engine_replicate}, but "
+                    f"this front-end expects "
+                    f"{parallel_config.data_parallel_replicate_moe}. Please "
+                    f"ensure all nodes use the same "
+                    f"--data-parallel-replicate-moe setting."
+                )
+            if coordinated_dp:
+                handshake_parallel_config: dict[str, bool | int | str | list[int]] = {
+                    k: getattr(parallel_config, k)
+                    for k in (
+                        "data_parallel_master_ip",
+                        "data_parallel_master_port",
+                        "_data_parallel_master_port_list",
+                        "data_parallel_size",
+                        "data_parallel_replicate_moe",
+                    )
+                }
+            elif replicated_moe_dp:
+                handshake_parallel_config = {"data_parallel_replicate_moe": True}
+            else:
+                handshake_parallel_config = {}
             # Send init message with DP config info.
             init_message = msgspec.msgpack.encode(
                 EngineHandshakeMetadata(
                     addresses=launch.addresses,
-                    parallel_config={
-                        k: getattr(parallel_config, k)
-                        for k in (
-                            "data_parallel_master_ip",
-                            "data_parallel_master_port",
-                            "_data_parallel_master_port_list",
-                            "data_parallel_size",
-                        )
-                    }
-                    if coordinated_dp
-                    else {},
+                    parallel_config=handshake_parallel_config,
                 )
             )
             handshake_socket.send_multipart((eng_identity, init_message), copy=False)
@@ -1384,8 +1418,10 @@ def wait_for_engine_startup(
             start_pending[0 if local else 1] += 1
             engine.state = CoreEngineState.CONNECTED
         elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
-            # Validate config hash consistency across DP workers for MoE models.
-            if coordinated_dp:
+            # Validate config hash consistency across DP workers for MoE
+            # models. Replicated-MoE engines hash their config prior to its
+            # localization to DP=1 so that it remains comparable.
+            if coordinated_dp or replicated_moe_dp:
                 worker_config_hash = msg.get("parallel_config_hash")
                 expected_hash = parallel_config.compute_hash()
                 if worker_config_hash != expected_hash:

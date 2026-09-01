@@ -1042,7 +1042,9 @@ class EngineCoreProc(EngineCore):
         tensor_queue: Queue | None = None,
         *,
         engine_index: int = 0,
+        pre_localized_config_hash: str | None = None,
     ):
+        self.pre_localized_config_hash = pre_localized_config_hash
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
@@ -1241,11 +1243,16 @@ class EngineCoreProc(EngineCore):
                 "local": local_client,
                 "headless": headless,
             }
-            # Include config hash for DP configuration validation
+            # Include config hash for DP configuration validation. Engines
+            # already localized to DP=1 (replicated MoE) send the hash of
+            # their pre-localization config, which the front-end compares
+            # against its own global config.
             if vllm_config.parallel_config.data_parallel_size > 1:
                 ready_msg["parallel_config_hash"] = (
                     vllm_config.parallel_config.compute_hash()
                 )
+            elif self.pre_localized_config_hash is not None:
+                ready_msg["parallel_config_hash"] = self.pre_localized_config_hash
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
 
@@ -1257,15 +1264,25 @@ class EngineCoreProc(EngineCore):
         parallel_config: ParallelConfig | None = None,
     ) -> EngineZmqAddresses:
         # Send registration message.
-        handshake_socket.send(
-            msgspec.msgpack.encode(
-                {
-                    "status": "HELLO",
-                    "local": local_client,
-                    "headless": headless,
-                }
+        hello_msg: dict[str, Any] = {
+            "status": "HELLO",
+            "local": local_client,
+            "headless": headless,
+        }
+        if (
+            parallel_config is not None
+            and parallel_config.is_moe_model
+            and (
+                parallel_config.data_parallel_size > 1
+                or parallel_config.data_parallel_replicate_moe
             )
-        )
+        ):
+            # Report whether this engine runs as an independent replica
+            # so that the front-end can fail fast on a mismatch.
+            hello_msg["data_parallel_replicate_moe"] = (
+                parallel_config.data_parallel_replicate_moe
+            )
+        handshake_socket.send(msgspec.msgpack.encode(hello_msg))
 
         # Receive initialization message.
         logger.debug("Waiting for init message from front-end.")
@@ -1282,8 +1299,41 @@ class EngineCoreProc(EngineCore):
         logger.debug("Received init message: %s", init_message)
 
         if parallel_config is not None:
+            received_replicate = init_message.parallel_config.get(
+                "data_parallel_replicate_moe"
+            )
+            if parallel_config.data_parallel_replicate_moe:
+                # An independent replica must receive exactly the replicate
+                # flag and nothing else: a missing/False flag or any DP
+                # topology field (e.g. from a front-end started without
+                # --data-parallel-replicate-moe) would silently re-widen this
+                # engine back to DP>1. Fail before joining any DP group or
+                # applying the front-end config.
+                unexpected_keys = sorted(
+                    set(init_message.parallel_config) - {"data_parallel_replicate_moe"}
+                )
+                if received_replicate is not True or unexpected_keys:
+                    raise RuntimeError(
+                        "This engine was started with "
+                        "--data-parallel-replicate-moe but the front-end init "
+                        "message does not describe an independent replica "
+                        f"(data_parallel_replicate_moe={received_replicate}, "
+                        f"unexpected fields={unexpected_keys}). Please ensure "
+                        "all nodes use the same --data-parallel-replicate-moe "
+                        "setting."
+                    )
+            elif received_replicate:
+                raise RuntimeError(
+                    "The front-end was started with --data-parallel-replicate-moe "
+                    "but this engine was not. Please ensure all nodes use the "
+                    "same --data-parallel-replicate-moe setting."
+                )
             for key, value in init_message.parallel_config.items():
                 setattr(parallel_config, key, value)
+            assert (
+                not parallel_config.data_parallel_replicate_moe
+                or parallel_config.data_parallel_size == 1
+            ), "replicated-MoE engine must remain localized to DP=1"
 
         return init_message.addresses
 
@@ -1324,14 +1374,19 @@ class EngineCoreProc(EngineCore):
                 )
 
             parallel_config.data_parallel_index = dp_rank
-            if data_parallel and vllm_config.model_config.is_moe:
+            if data_parallel and parallel_config.moe_spans_dp:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
-                # Non-MoE DP ranks are completely independent, so treat like DP=1.
-                # Note that parallel_config.data_parallel_index will still reflect
+                # Non-MoE and replicated-MoE DP ranks are completely
+                # independent, so treat like DP=1. Note that
+                # parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
+                if data_parallel and parallel_config.data_parallel_replicate_moe:
+                    # Hash the config before it is localized to DP=1 so that
+                    # the front-end can validate consistency across DP ranks.
+                    kwargs["pre_localized_config_hash"] = parallel_config.compute_hash()
                 parallel_config.reconfigure_for_independent_dp_rank()
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
@@ -2015,8 +2070,9 @@ class DPEngineCoreProc(EngineCoreProc):
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
     ):
-        assert vllm_config.model_config.is_moe, (
-            "DPEngineCoreProc should only be used for MoE models"
+        assert vllm_config.parallel_config.moe_spans_dp, (
+            "DPEngineCoreProc should only be used for MoE models whose "
+            "expert layers span the DP ranks"
         )
 
         scheduler_config = vllm_config.scheduler_config
