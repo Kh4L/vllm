@@ -119,6 +119,7 @@ def _make_vllm_config() -> SimpleNamespace:
             data_parallel_size_local=1,
             enable_elastic_ep=False,
             world_size=1,
+            moe_spans_dp=False,
         ),
         model_config=SimpleNamespace(is_moe=False),
         kv_transfer_config=None,
@@ -238,6 +239,8 @@ def _make_vllm_config_ray_dp_multinode() -> SimpleNamespace:
             local_engines_only=False,
             enable_elastic_ep=False,
             world_size=1,
+            moe_spans_dp=False,
+            data_parallel_replicate_moe=False,
         ),
         model_config=SimpleNamespace(multimodal_config=None, is_moe=False),
         cache_config=SimpleNamespace(),
@@ -363,3 +366,78 @@ def test_ray_dp_addresses_resolved_before_actor_creation(
                 "time they DEALER-connect. See PR #42585 / Ray-DP "
                 "multi-API-server regression."
             )
+
+
+class _StubIndependentActor(_StubEngineCoreActor):
+    def get_marker(self) -> str:
+        return "independent"
+
+
+class _StubDPMoEActor(_StubEngineCoreActor):
+    def get_marker(self) -> str:
+        return "dp_moe"
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    ("is_moe", "moe_spans_dp", "expected_marker"),
+    [
+        # Lockstep MoE DP selects the coordinated actor class.
+        (True, True, "dp_moe"),
+        # Replicated MoE runs as independent replicas (dense-style actors).
+        (True, False, "independent"),
+        (False, False, "independent"),
+    ],
+)
+@pytest.mark.usefixtures("ray_context_dp2")
+def test_actor_class_selection_follows_moe_spans_dp(
+    monkeypatch: pytest.MonkeyPatch,
+    is_moe: bool,
+    moe_spans_dp: bool,
+    expected_marker: str,
+) -> None:
+    """CoreEngineActorManager selects DPMoEEngineCoreActor only when the
+    expert layers span the DP ranks; replicated-MoE configs get the same
+    independent actors as dense models."""
+    created_placement_groups: list[Any] = []
+
+    def create_dp_placement_groups(vllm_config: Any):
+        pg1 = _make_cpu_placement_group()
+        pg2 = _make_cpu_placement_group()
+        created_placement_groups.extend([pg1, pg2])
+        return [pg1, pg2], [0, 0]
+
+    monkeypatch.setattr("vllm.v1.engine.core.EngineCoreActor", _StubIndependentActor)
+    monkeypatch.setattr("vllm.v1.engine.core.DPMoEEngineCoreActor", _StubDPMoEActor)
+    monkeypatch.setattr(
+        CoreEngineActorManager,
+        "create_dp_placement_groups",
+        staticmethod(create_dp_placement_groups),
+    )
+
+    vllm_config = _make_vllm_config_ray_dp_multinode()
+    vllm_config.parallel_config.data_parallel_size_local = 2
+    vllm_config.model_config.is_moe = is_moe
+    vllm_config.parallel_config.moe_spans_dp = moe_spans_dp
+    vllm_config.parallel_config.data_parallel_replicate_moe = (
+        is_moe and not moe_spans_dp
+    )
+
+    manager: CoreEngineActorManager | None = None
+    try:
+        manager = CoreEngineActorManager(
+            vllm_config=vllm_config,
+            addresses=_make_addresses(),
+            executor_class=_DummyExecutor,
+            log_stats=False,
+        )
+        actors = manager.local_engine_actors + manager.remote_engine_actors
+        assert actors
+        markers = ray.get([actor.get_marker.remote() for actor in actors])
+        assert markers == [expected_marker] * len(actors)
+    finally:
+        if manager is not None:
+            manager.shutdown()
+        else:
+            for pg in created_placement_groups:
+                ray.util.remove_placement_group(pg)
