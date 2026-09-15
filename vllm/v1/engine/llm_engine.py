@@ -83,6 +83,11 @@ class LLMEngine:
             and parallel_config.data_parallel_size > 1
             and not self.external_launcher_dp
         ):
+            if parallel_config.data_parallel_replicate_moe:
+                raise NotImplementedError(
+                    "--data-parallel-replicate-moe is not supported with "
+                    "in-process (offline) data parallelism."
+                )
             self.dp_group = parallel_config.stateless_init_dp_group()
         else:
             self.dp_group = None

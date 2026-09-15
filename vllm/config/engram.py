@@ -84,6 +84,14 @@ class EngramConfig:
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
+        if parallel_config.data_parallel_replicate_moe and (
+            self.embedding_across_dp or self.dp_shared_memory
+        ):
+            raise NotImplementedError(
+                "--data-parallel-replicate-moe runs every DP rank as an "
+                "independent replica, so Engram embedding_across_dp and "
+                "dp_shared_memory are not supported."
+            )
         if self.dp_shared_memory:
             if parallel_config.data_parallel_size <= 1:
                 raise ValueError("dp_shared_memory requires data_parallel_size > 1.")
