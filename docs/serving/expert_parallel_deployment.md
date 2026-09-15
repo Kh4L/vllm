@@ -65,7 +65,7 @@ For example, with `TP=2, DP=4` (8 GPUs total):
 - Attention layers use TP=2 within each of the 4 DP groups
 
 !!! note "Key Difference from Data Parallel Deployment"
-    Without `--enable-expert-parallel`, MoE layers would use tensor parallelism (forming a TP group of size `TP × DP`), similar to dense models. With EP enabled, expert layers switch to expert parallelism, which can provide better efficiency and locality for MoE models.
+    Without `--enable-expert-parallel`, MoE layers would use tensor parallelism (forming a TP group of size `TP × DP`), similar to dense models. With EP enabled, expert layers switch to expert parallelism, which can provide better efficiency and locality for MoE models. Alternatively, `--data-parallel-replicate-moe` replicates complete expert weights on every DP rank so the ranks run as fully independent replicas; see [Data Parallel Deployment](data_parallel_deployment.md#replicated-moe).
 
 ### Example Command
 
