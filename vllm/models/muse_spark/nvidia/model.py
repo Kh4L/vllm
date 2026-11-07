@@ -111,6 +111,11 @@ from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
     supports_norm_residual_norm,
 )
 from vllm.models.muse_spark.common.ops.fused_routing import fused_musespark1x_routing
+from vllm.models.muse_spark.nvidia.hot_experts import (
+    hot_experts_for_layer,
+    split_hot_cold_experts,
+    validate_hot_experts,
+)
 from vllm.models.muse_spark.nvidia.mega_moe import (
     MuseSparkMegaMoEExperts,
     get_trtllm_token_threshold,
@@ -151,6 +156,7 @@ from vllm.transformers_utils.configs.muse_spark import (
     MuseSparkTextConfig,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.utils.mem_utils import format_gib
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
 
@@ -419,6 +425,9 @@ class MuseSpark1xMoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts
+        self.hot_experts = hot_experts_for_layer(
+            vllm_config, layer_idx, self.num_experts
+        )
         parallel_config = vllm_config.parallel_config
         mega_backend = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         layer_is_nvfp4 = isinstance(
@@ -653,6 +662,8 @@ class MuseSpark1xMoE(nn.Module):
                     eps=norm.variance_epsilon,
                     gain_center=norm.fused_gain_center,
                 )
+            if self.hot_experts is not None:
+                validate_hot_experts(self)
             return
         self.experts = FusedMoEFactory(
             num_experts=config.num_local_experts,
@@ -676,6 +687,8 @@ class MuseSpark1xMoE(nn.Module):
             },
             moe_config_cls=MuseSparkMoEConfig,
         )
+        if self.hot_experts is not None:
+            validate_hot_experts(self)
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
@@ -1880,6 +1893,36 @@ class MuseSpark1xModel(LlamaModel):
             # Free the pre-repack blocks before the KV cache is sized.
             torch.accelerator.empty_cache()
 
+    def split_hot_cold_experts(self) -> None:
+        moes = [
+            layer.feed_forward
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if isinstance(layer.feed_forward, MuseSpark1xMoE)
+            and layer.feed_forward.hot_experts is not None
+        ]
+        if not moes:
+            return
+        # GPU-resident layers first: the memory they free takes the hot experts
+        # of the CPU-offloaded ones.
+        moes.sort(
+            key=lambda moe: getattr(
+                moe.experts.routed_experts.w13_weight, "_vllm_is_uva_offloaded", False
+            )
+        )
+        cold_bytes = 0
+        for moe in moes:
+            assert moe.hot_experts is not None
+            cold_bytes += split_hot_cold_experts(
+                moe.experts, moe.hot_experts, (moe.router.weight, moe.expert_bias)
+            )
+        torch.accelerator.empty_cache()
+        logger.info(
+            "MuseSpark hot experts: %d MoE layers keep their listed experts in GPU "
+            "memory; their other experts take %s in CPU memory.",
+            len(moes),
+            format_gib(cold_bytes),
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         return self.tok_embeddings_norm(hidden_states, out_dtype=self.residual_dtype)
@@ -2039,6 +2082,14 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         # self.model, built by the model state once the weights are loaded.
         self.specialized_decode_config = specialized_decode_config(vllm_config)
         self.specialized_decode: SpecializedDecode | None = None
+        if (
+            self.specialized_decode_config is not None
+            and vllm_config.offload_config.uva.cpu_offload_hot_experts is not None
+        ):
+            raise NotImplementedError(
+                "The Muse Spark specialized decode does not support "
+                "--cpu-offload-hot-experts."
+            )
 
     def build_specialized_decode(self) -> None:
         from vllm.models.muse_spark.nvidia.specialized_decode.runtime.decode import (
@@ -2187,6 +2238,7 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 "the model's weights"
             )
         self.model.finalize_mega_moe_weights()
+        self.model.split_hot_cold_experts()
         n_gates = materialize_residual_path_constants(self)
         logger.info(
             "Materialized residual-path constants for %d gated residual connections",

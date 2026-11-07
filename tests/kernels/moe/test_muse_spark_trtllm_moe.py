@@ -29,12 +29,14 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.distributed import get_tp_group
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.models.muse_spark.common.layers import (
     MuseSpark1xRMSNorm,
     MuseSpark1xRMSNormWithInputScale,
 )
+from vllm.models.muse_spark.nvidia.hot_experts import split_hot_cold_experts
 from vllm.models.muse_spark.nvidia.mega_moe import MuseSparkMegaMoEExperts
 from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MusePostExpertFinalize,
@@ -440,6 +442,59 @@ def test_muse_spark_moe_cudagraph(nvfp4, dist_init, workspace_init):
         ckpt, quant_config = _bf16_checkpoint(), None
     _, _, _, vllm_config, runner = build_moe(MuseSpark1xRMSNorm, ckpt, quant_config)
     assert_cudagraph_replays(runner, vllm_config, *_inputs(5), *_inputs(6))
+
+
+@pytest.mark.parametrize(
+    "num_hot, routes",
+    [(11, "mixed"), (11, "hot"), (11, "cold"), (0, "mixed"), (E, "mixed")],
+)
+@torch.inference_mode()
+def test_muse_spark_hot_cold_experts_match_resident(
+    num_hot, routes, dist_init, workspace_init
+):
+    """Experts split between GPU and CPU memory match all-resident experts, on
+    both the kernel-routed and the caller-routed paths."""
+    router, routed, _, vllm_config, runner = build_moe(
+        MuseSpark1xRMSNorm, _nvfp4_checkpoint(), nvfp4_quant_config()
+    )
+    hot_ids = torch.randperm(E, generator=torch.Generator().manual_seed(1))
+    hot_ids = hot_ids[:num_hot].tolist()
+    perm = hot_ids + sorted(set(range(E)) - set(hot_ids))
+    x, logits = _inputs(7)
+    if routes != "mixed":
+        # Every top-k lands in one bank; the other kernel call gets no routes.
+        side = perm[:num_hot] if routes == "hot" else perm[num_hot:]
+        logits[:, side] += 20
+
+    def forward_prepared(logits):
+        a1q, a1q_scale = ops.scaled_fp4_quant(
+            x, runner.nvfp4_input_global_scale, is_sf_swizzled_layout=False
+        )
+        weights, ids = router._compute_routing(x, logits, torch.int32)
+        with (
+            set_current_vllm_config(vllm_config),
+            set_forward_context(None, vllm_config),
+        ):
+            return runner.forward_prepared_nvfp4(a1q, a1q_scale, (ids, weights))
+
+    expected = run_moe(runner, vllm_config, x, logits)
+    expected_prepared = forward_prepared(logits)
+
+    allocated = torch.accelerator.memory_allocated()
+    cold_bytes = split_hot_cold_experts(runner, hot_ids, (router.expert_bias,))
+    # The full-size tensors are freed (1 MiB of slack for small allocations).
+    assert torch.accelerator.memory_allocated() - allocated < 2**20 - cold_bytes
+    experts = routed.quant_method.moe_kernel.fused_experts
+    assert [bank.num_experts for bank in experts.expert_banks] == [
+        n for n in (num_hot, E - num_hot) if n
+    ]
+
+    logits = logits[:, perm]
+    # The banks see the same routes and weights as the resident experts.
+    assert _rel(run_moe(runner, vllm_config, x, logits), expected) < 1e-2
+    assert _rel(forward_prepared(logits), expected_prepared) < 1e-2
+    if routes == "mixed":
+        assert_cudagraph_replays(runner, vllm_config, *_inputs(5), *_inputs(6))
 
 
 @torch.inference_mode()

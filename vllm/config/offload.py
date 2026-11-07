@@ -43,6 +43,13 @@ class UVAOffloadConfig:
     This allows distinguishing parameters like "w2_weight" and "w2_weight_scale".
     """
 
+    cpu_offload_hot_experts: str | None = None
+    """Path to a JSON file mapping MoE layer indices to the expert IDs kept in
+    GPU memory, e.g. `{"3": [17, 4, 250]}`. After loading, the other experts of
+    each listed layer move to CPU memory and are read through UVA. Only Muse
+    Spark's NVFP4 FlashInfer TRT-LLM MoE layers support it for now.
+    """
+
 
 @config
 class PrefetchOffloadConfig:

@@ -68,6 +68,7 @@ from vllm.models.muse_spark.common.moe import (
     MuseSparkMoEConfig as CommonMuseSparkMoEConfig,
 )
 from vllm.models.muse_spark.common.ops.fused_finalize import fused_post_expert_finalize
+from vllm.models.muse_spark.nvidia.hot_experts import ExpertBank, merge_unfinalized
 from vllm.models.muse_spark.nvidia.ops.cute_dsl.moe_finalize_rmsnorm import (
     moe_finalize_with_rmsnorm,
     supports_moe_finalize,
@@ -505,6 +506,134 @@ class _MuseSparkNvFp4Scales:
 class MuseSparkTrtLlmNvFp4Experts(_MuseSparkNvFp4Scales, TrtLlmNvFp4ExpertsMonolithic):
     """Monolithic NVFP4 experts: TP, TP+EP and allgather_reducescatter."""
 
+    # Set by `split_hot_cold_experts`: the experts run as one kernel call per bank.
+    expert_banks: tuple[ExpertBank, ...] | None = None
+
+    def _full_bank(self, w1: torch.Tensor, w2: torch.Tensor) -> ExpertBank:
+        quant_config = self.quant_config
+        assert quant_config.w1_scale is not None
+        assert quant_config.w2_scale is not None
+        assert quant_config.g1_alphas is not None
+        assert quant_config.g2_alphas is not None
+        return ExpertBank(
+            offset=self.ep_rank * self.local_num_experts,
+            num_experts=self.local_num_experts,
+            w13=w1,
+            w13_scale=quant_config.w1_scale,
+            w2=w2,
+            w2_scale=quant_config.w2_scale,
+            g1_alphas=quant_config.g1_alphas,
+            g1_scale_c=self.g1_scale_c,
+            g2_alphas=quant_config.g2_alphas,
+        )
+
+    def _bank_kernel_args(
+        self,
+        bank: ExpertBank,
+        a1q: torch.Tensor,
+        a1q_scale: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+    ) -> dict[str, Any]:
+        return dict(
+            hidden_states=a1q,
+            hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
+                a1q.shape[0], -1
+            ),
+            gemm1_weights=bank.w13,
+            gemm1_weights_scale=bank.w13_scale.view(torch.float8_e4m3fn),
+            gemm1_bias=None,
+            gemm1_alpha=self.gemm1_alpha,
+            gemm1_beta=self.gemm1_beta,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
+            gemm2_weights=bank.w2,
+            gemm2_weights_scale=bank.w2_scale.view(torch.float8_e4m3fn),
+            gemm2_bias=None,
+            output1_scale_scalar=bank.g1_scale_c,
+            output1_scale_gate_scalar=bank.g1_alphas,
+            output2_scale_scalar=bank.g2_alphas,
+            num_experts=global_num_experts,
+            top_k=self.topk,
+            intermediate_size=self.intermediate_size_per_partition,
+            local_expert_offset=bank.offset,
+            local_num_experts=bank.num_experts,
+            routing_method_type=self.routing_method_type,
+            do_finalize=False,
+            activation_type=activation_to_flashinfer_int(activation),
+            tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
+        )
+
+    def _finalize_banks(self, outputs: list, num_tokens: int) -> torch.Tensor:
+        """Finalize once: twice would write ``out`` and all-reduce twice."""
+        return self._run_post_gemm2_hook(
+            merge_unfinalized(
+                [
+                    convert_flashinfer_moe_output(
+                        output,
+                        do_finalize=False,
+                        num_tokens=num_tokens,
+                        top_k=self.topk,
+                    )
+                    for output in outputs
+                ]
+            )
+        )
+
+    def apply(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        num_expert_group: int | None = None,
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float | None = None,
+        topk_group: int | None = None,
+        routing_replay_out: torch.Tensor | None = None,
+    ) -> torch.Tensor | UnfinalizedMoEOutput:
+        num_tokens = hidden_states.shape[0]
+        if self.expert_banks is None or num_tokens == 0:
+            return super().apply(
+                hidden_states,
+                w1,
+                w2,
+                router_logits,
+                activation,
+                global_num_experts,
+                expert_map,
+                a1q_scale,
+                apply_router_weight_on_input,
+                num_expert_group,
+                e_score_correction_bias,
+                routed_scaling_factor,
+                topk_group,
+                routing_replay_out,
+            )
+        import flashinfer
+
+        assert a1q_scale is not None and self._uses_post_gemm2_hook(num_tokens)
+        # Recorded routes would carry the renumbered expert IDs.
+        assert routing_replay_out is None
+        outputs = [
+            flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+                routing_logits=router_logits,
+                routing_bias=e_score_correction_bias,
+                n_group=num_expert_group or 0,
+                topk_group=topk_group or 0,
+                routed_scaling_factor=routed_scaling_factor,
+                **self._bank_kernel_args(
+                    bank, hidden_states, a1q_scale, activation, global_num_experts
+                ),
+            )
+            for bank in self.expert_banks
+        ]
+        return self._finalize_banks(outputs, num_tokens)
+
     def apply_routed(
         self,
         a1q: torch.Tensor,
@@ -519,50 +648,21 @@ class MuseSparkTrtLlmNvFp4Experts(_MuseSparkNvFp4Scales, TrtLlmNvFp4ExpertsMonol
         """Experts on quantized input with routing computed by the caller."""
         import flashinfer
 
-        num_tokens = a1q.shape[0]
-        assert self._uses_post_gemm2_hook(num_tokens)
-        assert self.quant_config.w1_scale is not None
-        assert self.quant_config.w2_scale is not None
-        flashinfer_output = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
-            topk_ids=(topk_ids, topk_weights),
-            routing_bias=None,
-            hidden_states=a1q,
-            hidden_states_scale=a1q_scale.view(torch.float8_e4m3fn).reshape(
-                num_tokens, -1
-            ),
-            gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
-            gemm1_alpha=self.gemm1_alpha,
-            gemm1_beta=self.gemm1_beta,
-            gemm1_clamp_limit=self.gemm1_clamp_limit,
-            gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
-            output1_scale_scalar=self.g1_scale_c,
-            output1_scale_gate_scalar=self.quant_config.g1_alphas,
-            output2_scale_scalar=self.quant_config.g2_alphas,
-            num_experts=global_num_experts,
-            top_k=self.topk,
-            n_group=0,
-            topk_group=0,
-            intermediate_size=self.intermediate_size_per_partition,
-            local_expert_offset=self.ep_rank * self.local_num_experts,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=self.routing_method_type,
-            do_finalize=False,
-            activation_type=activation_to_flashinfer_int(activation),
-            tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
-        )
-        return self._run_post_gemm2_hook(
-            convert_flashinfer_moe_output(
-                flashinfer_output,
-                do_finalize=False,
-                num_tokens=num_tokens,
-                top_k=self.topk,
+        assert self._uses_post_gemm2_hook(a1q.shape[0])
+        outputs = [
+            flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
+                topk_ids=(topk_ids, topk_weights),
+                routing_bias=None,
+                n_group=0,
+                topk_group=0,
+                routed_scaling_factor=None,
+                **self._bank_kernel_args(
+                    bank, a1q, a1q_scale, activation, global_num_experts
+                ),
             )
-        )
+            for bank in self.expert_banks or (self._full_bank(w1, w2),)
+        ]
+        return self._finalize_banks(outputs, a1q.shape[0])
 
 
 class MuseSparkTrtLlmNvFp4ExpertsModular(

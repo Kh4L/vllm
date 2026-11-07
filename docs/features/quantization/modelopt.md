@@ -57,6 +57,28 @@ other dispatch paths retain their backend-specific behavior.
 Set `VLLM_MOE_SKIP_PADDING=0` before starting the engine to disable this
 optimization for comparisons.
 
+When Muse Spark NVFP4 does not fit in GPU memory, `--cpu-offload-gb` offloads
+whole MoE layers, so every step reads all of their experts from CPU memory.
+`--cpu-offload-hot-experts` keeps a fixed set of frequently routed experts in
+GPU memory for every listed layer instead. It takes a JSON file mapping layer
+indices to expert IDs:
+
+```bash
+vllm serve meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --cpu-offload-gb 264 --cpu-offload-params experts \
+  --cpu-offload-hot-experts hot_experts.json
+```
+
+with `hot_experts.json` like `{"1": [17, 4, 250, ...], "2": [...], ...}`.
+Loading still uses `--cpu-offload-gb`. Afterwards, each listed layer keeps
+the listed experts in GPU memory and moves its other experts to CPU memory,
+which the TRT-LLM MoE reads through UVA. Size the hot sets so that the experts
+kept in GPU memory take about as much as the experts `--cpu-offload-gb` left
+in GPU memory after loading. It requires the FlashInfer
+TRT-LLM NVFP4 MoE without expert parallelism. Layers with BF16 or online
+quantized experts, MegaMoE, the specialized decode and weight reloading are not
+supported.
+
 ## Benchmarking with dummy weights
 
 For performance experiments with random weights, use `--load-format dummy`.
