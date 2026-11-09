@@ -62,10 +62,12 @@ def _quantize_moe_weight_to_nvfp4(
         else weight.device
     )
 
-    amax = weight_amax(weight.flatten(1), dim=-1).to(device, torch.float32)
-    amax = amax_for_moe_weight_quant(amax, moe_tp_size).clamp_min(1e-8)
-    global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
-    weight_scale_2 = (1.0 / global_scale).to(torch.float32)
+    global_scale = None
+    if moe_tp_size > 1:
+        # The TP all-reduce needs every expert's amax before any is quantized.
+        amax = weight_amax(weight.flatten(1), dim=-1).to(device, torch.float32)
+        amax = amax_for_moe_weight_quant(amax, moe_tp_size).clamp_min(1e-8)
+        global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
 
     # Keep the original BF16/FP16 values as the quantizer input. Folding each
     # expert's FP32 global scale into the weight would add a BF16/FP16 rounding
@@ -74,11 +76,18 @@ def _quantize_moe_weight_to_nvfp4(
     block_scale = torch.empty(
         (num_experts, n, k // 16), dtype=torch.float8_e4m3fn, device=device
     )
-    for expert, expert_scale in enumerate(global_scale):
+    weight_scale_2 = torch.empty(num_experts, dtype=torch.float32, device=device)
+    for expert in range(num_experts):
+        expert_weight = weight[expert].to(device).contiguous()
+        if global_scale is None:
+            # On the device, from the copy the quantizer reads anyway.
+            amax = weight_amax(expert_weight).to(torch.float32).clamp_min(1e-8)
+            expert_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
+        else:
+            expert_scale = global_scale[expert]
+        weight_scale_2[expert] = 1.0 / expert_scale
         qweight[expert], block_scale[expert] = scaled_fp4_quant(
-            weight[expert].to(device).contiguous(),
-            expert_scale,
-            is_sf_swizzled_layout=False,
+            expert_weight, expert_scale, is_sf_swizzled_layout=False
         )
     return (
         qweight,
