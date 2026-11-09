@@ -32,7 +32,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     weight_amax,
 )
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
-from vllm.model_executor.offloader import NoopOffloader, get_offloader
+from vllm.model_executor.offloader import UVAOffloader, get_offloader
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
@@ -134,13 +134,18 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             params_dtype,
             **extra_weight_attrs,
         )
-        # CPU weight offloading means device memory is short: stage the
+        # UVA offloading of the experts means device memory is short: stage the
         # full-precision experts on the CPU and quantize one at a time on the
         # device.
-        if self.requantization_source is None and not isinstance(
-            get_offloader(), NoopOffloader
+        # TODO: move this decision to OnlineMoEMethodBase.create_weights, for
+        # the other online MoE methods, once their quantizers take CPU input.
+        offloader = get_offloader()
+        if (
+            self.requantization_source is None
+            and isinstance(offloader, UVAOffloader)
+            and offloader.targets(f"{layer.layer_name}.w13_weight")
         ):
-            get_layerwise_info(layer).restore_device = torch.device("cpu")
+            get_layerwise_info(layer).stage_on_cpu = True
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):

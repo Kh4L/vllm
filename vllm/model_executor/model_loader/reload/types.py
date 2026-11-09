@@ -16,8 +16,12 @@ class LayerReloadingInfo:
     # model format metadata, recorded by `record_metadata_for_reloading`
     restore_metadata: LayerTensors
 
-    # device to materialize layers with; online quantization may stage on the CPU
+    # device to materialize layers with, recorded by `record_metadata_for_reloading`
     restore_device: torch.device
+
+    # materialize on the CPU instead: online quantization of a layer that the
+    # UVA offloader targets stages its full-precision weights there
+    stage_on_cpu: bool = False
 
     # track how many elements are ready for loading, used by `online_process_loader`
     load_numel: int = 0
@@ -36,7 +40,9 @@ class LayerReloadingInfo:
 
     def reset(self):
         self.__init__(  # type: ignore[misc]
-            restore_metadata=self.restore_metadata, restore_device=self.restore_device
+            restore_metadata=self.restore_metadata,
+            restore_device=self.restore_device,
+            stage_on_cpu=self.stage_on_cpu,
         )
 
     def can_load(self) -> bool:

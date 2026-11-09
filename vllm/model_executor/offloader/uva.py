@@ -71,6 +71,14 @@ class UVAOffloader(BaseOffloader):
             )
         return modules
 
+    def targets(self, param_name: str) -> bool:
+        """Whether `cpu_offload_params` selects the parameter `param_name`."""
+        # Dots match full segments only: "experts.w2_weight" matches
+        # "mlp.experts.w2_weight" but not "mlp.experts.w2_weight_scale".
+        return not self.cpu_offload_params or any(
+            f".{param}." in f".{param_name}." for param in self.cpu_offload_params
+        )
+
     def _maybe_offload_to_cpu(self, module: nn.Module, prefix: str = "") -> nn.Module:
         """Offload module parameters to CPU using UVA if budget allows."""
         if (params := next(module.parameters(), None)) is None:
@@ -103,17 +111,8 @@ class UVAOffloader(BaseOffloader):
             if p.is_meta:
                 continue
 
-            if self.cpu_offload_params:
-                # Check if parameter belongs to the offloading set
-                # Add dots here to ensure we match full segments only
-                # e.g., "experts.w2_weight" matches "mlp.experts.w2_weight"
-                # but not "mlp.experts.w2_weight_scale"
-                should_offload = any(
-                    f".{param}." in f".{prefix}{name}."
-                    for param in self.cpu_offload_params
-                )
-                if not should_offload:
-                    continue
+            if not self.targets(f"{prefix}{name}"):
+                continue
 
             cpu_data = p.data.to(device="cpu")
             if self.pin_memory:

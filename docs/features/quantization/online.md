@@ -188,7 +188,7 @@ vllm serve meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
   --quantization-config '{"targets":{"*layers.0.feed_forward.experts*":"nvfp4_per_token","*layers.61.feed_forward.experts*":"nvfp4_per_token"}}'
 ```
 
-With CPU weight offloading (`--cpu-offload-gb`), `nvfp4_per_token` stages the full-precision experts on the CPU and moves them to the GPU one expert at a time to quantize them. The quantized experts stay on the GPU.
+When `--cpu-offload-gb` offloads the experts (`--cpu-offload-params` empty or matching them), `nvfp4_per_token` stages the full-precision experts on the CPU and moves them to the GPU one expert at a time to quantize them. The quantized experts stay on the GPU.
 Muse Spark cannot re-quantize the experts that are NVFP4 in the checkpoint: a target that matches them raises an error.
 
 !!! info
