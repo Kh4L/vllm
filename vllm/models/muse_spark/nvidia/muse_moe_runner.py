@@ -827,6 +827,11 @@ class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
         if quant_config is not None:
             quant_method = resolve_quant_method(quant_config, self, prefix)
             if isinstance(quant_method, OnlineMoEMethodBase):
+                # Muse normalizes each expert's output before the top-k sum, so
+                # its experts must stop after GEMM2 and call `post_gemm2_hook`.
+                # Backends that finalize inside the kernel would skip the norm
+                # silently. Of those that call the hook, only TRT-LLM NVFP4 is
+                # validated with Muse's in-kernel MiniMax2 routing.
                 if not (
                     isinstance(quant_method, Nvfp4OnlineMoEMethod)
                     and quant_method.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
