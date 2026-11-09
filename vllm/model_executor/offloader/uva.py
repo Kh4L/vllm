@@ -106,12 +106,16 @@ class UVAOffloader(BaseOffloader):
             # memory), so the marker is the only way to recognize those.
             if p.device.type == "cpu" or getattr(p, "_vllm_is_uva_offloaded", False):
                 continue
+            if not self.targets(f"{prefix}{name}"):
+                continue
             # Online quantization creates meta weights and replaces them after
             # loading; they have no data to offload.
+            # TODO: offload the quantized weights once they exist.
             if p.is_meta:
-                continue
-
-            if not self.targets(f"{prefix}{name}"):
+                logger.warning_once(
+                    "CPU offloading skips weights that online quantization "
+                    "creates at load time: they stay in GPU memory."
+                )
                 continue
 
             cpu_data = p.data.to(device="cpu")

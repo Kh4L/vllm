@@ -46,6 +46,11 @@ vllm serve Qwen/Qwen3.5-35B-A3B --quantization mxfp4 \
 vllm serve Qwen/Qwen3.6-35B-A3B --quantization lut_b_moe
 ```
 
+!!! note
+    `--cpu-offload-gb` does not offload the weights that online quantization
+    creates: they stay in GPU memory. Only layers that are not quantized online
+    are offloaded.
+
 ## Supported Schemes
 
 | Scheme | Weight recipe | Activation recipe | Notes |
